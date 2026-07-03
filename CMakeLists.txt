@@ -21,3 +21,8 @@ target_link_libraries(relay_server PRIVATE pthread)
 
 add_executable(keygen_test keygen_test.cpp)
 target_link_libraries(keygen_test PRIVATE sodium)
+
+add_executable(peer_client peer_client.cpp)
+target_include_directories(peer_client PRIVATE /home/caliz/chatNT/asio/include)
+target_compile_definitions(peer_client PRIVATE ASIO_STANDALONE)
+target_link_libraries(peer_client PRIVATE sodium pthread)

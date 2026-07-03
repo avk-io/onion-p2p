@@ -26,16 +26,13 @@ std::string handleCommand(const std::string& line,
 
     if (command == "LIST") {
         std::ostringstream out;
+        out << peers.size() << "\n";
 
-        if (peers.empty()) {
-            out << "No peers\n";
-        } else {
-            for (const auto& peer : peers) {
-                out << peer.ip << " "
-                    << peer.port << " "
-                    << peer.pubkey << " "
-                    << peer.hashid << "\n";
-            }
+        for (const auto& peer : peers) {
+            out << peer.ip << " "
+                << peer.port << " "
+                << peer.pubkey << " "
+                << peer.hashid << "\n";
         }
 
         return out.str();
