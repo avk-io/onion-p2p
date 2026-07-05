@@ -26,3 +26,16 @@ add_executable(peer_client peer_client.cpp)
 target_include_directories(peer_client PRIVATE /home/caliz/chatNT/asio/include)
 target_compile_definitions(peer_client PRIVATE ASIO_STANDALONE)
 target_link_libraries(peer_client PRIVATE sodium pthread)
+
+add_executable(crypto_test crypto_test.cpp)
+target_link_libraries(crypto_test PRIVATE sodium)
+
+add_executable(peer_b peer_b.cpp)
+target_include_directories(peer_b PRIVATE /home/caliz/chatNT/asio/include)
+target_compile_definitions(peer_b PRIVATE ASIO_STANDALONE)
+target_link_libraries(peer_b PRIVATE pthread sodium)
+
+add_executable(peer_a peer_a.cpp)
+target_include_directories(peer_a PRIVATE /home/caliz/chatNT/asio/include)
+target_compile_definitions(peer_a PRIVATE ASIO_STANDALONE)
+target_link_libraries(peer_a PRIVATE pthread sodium)
