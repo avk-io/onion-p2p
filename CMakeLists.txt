@@ -39,3 +39,6 @@ add_executable(peer_a peer_a.cpp)
 target_include_directories(peer_a PRIVATE /home/caliz/chatNT/asio/include)
 target_compile_definitions(peer_a PRIVATE ASIO_STANDALONE)
 target_link_libraries(peer_a PRIVATE pthread sodium)
+
+add_executable(onion_test onion_test.cpp)
+target_link_libraries(onion_test PRIVATE sodium)
