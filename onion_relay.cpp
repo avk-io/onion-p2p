@@ -3,22 +3,71 @@
 #include <sodium.h>
 #include <fstream>
 #include <arpa/inet.h>
+#include "peer.hpp"
 
 using asio::ip::tcp;
 
-int main(int argc,char* argv[]) {
-    if(argc!=5){
+// Connects to the relay, sends LIST, parses the count-prefixed response,
+// and returns the Peer entry whose hashid matches target_hash_hex.
+// Returns false if no match was found.
+bool lookupPeerByHashId(
+    asio::io_context& io,
+    const std::string& relay_ip,
+    const std::string& relay_port,
+    const std::string& target_hash_hex,
+    Peer& out_peer)
+{
+    tcp::resolver resolver(io);
+    auto endpoints = resolver.resolve(relay_ip, relay_port);
+
+    tcp::socket socket(io);
+    asio::connect(socket, endpoints);
+
+    asio::write(socket, asio::buffer(std::string("LIST\n")));
+
+    asio::streambuf buf;
+    std::error_code error;
+
+    asio::read_until(socket, buf, '\n', error);
+    if (error) throw std::system_error(error);
+
+    std::istream is(&buf);
+    std::string line;
+    std::getline(is, line);
+    int n = std::stoi(line);
+
+    for (int i = 0; i < n; i++) {
+        asio::read_until(socket, buf, '\n', error);
+        if (error) throw std::system_error(error);
+
+        std::getline(is, line);
+
+        Peer peer;
+        std::istringstream iss(line);
+        iss >> peer.ip >> peer.port >> peer.pubkey >> peer.hashid;
+
+        if (peer.hashid == target_hash_hex) {
+            out_peer = peer;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc != 5) {
         std::cerr
             << "Usage: "
             << argv[0]
-            << " <own_port> <own_keyfile> <next_hop_ip> <next_hop_port>\n";
+            << " <own_port> <own_keyfile> <relay_ip> <relay_port>\n";
         return 1;
     }
     unsigned short own_port = std::stoi(argv[1]);
 
     std::string own_keyfile = argv[2];
-    std::string next_hop_ip = argv[3];
-    std::string next_hop_port = argv[4];
+    std::string relay_ip = argv[3];
+    std::string relay_port = argv[4];
 
     if (sodium_init() < 0)
         return 1;
@@ -26,7 +75,6 @@ int main(int argc,char* argv[]) {
     unsigned char p1_pk[crypto_box_PUBLICKEYBYTES];
     unsigned char p1_sk[crypto_box_SECRETKEYBYTES];
 
-    // Load or generate keypair
     std::ifstream keyfile_in(own_keyfile, std::ios::binary);
 
     if (keyfile_in) {
@@ -58,10 +106,82 @@ int main(int argc,char* argv[]) {
         sizeof(p1_pk)
     );
 
-    std::cout << "Node (" <<own_port<< ") Public Key:\n"
+    std::cout << "Node (" << own_port << ") Public Key:\n"
               << p1_pk_hex << "\n";
 
+    unsigned char hash[crypto_generichash_BYTES];
+
     asio::io_context io;
+
+    crypto_generichash(
+        hash,
+        sizeof(hash),
+        p1_pk,
+        sizeof(p1_pk),
+        nullptr,
+        0
+    );
+
+    char hash_hex[crypto_generichash_BYTES * 2 + 1];
+
+    sodium_bin2hex(
+        hash_hex,
+        sizeof(hash_hex),
+        hash,
+        sizeof(hash)
+    );
+
+    tcp::resolver resolver(io);
+
+    auto relay_endpoints =
+        resolver.resolve(relay_ip, relay_port);
+
+    tcp::socket relay_socket(io);
+
+    asio::connect(
+        relay_socket,
+        relay_endpoints
+    );
+
+    std::string command =
+        "REGISTER 127.0.0.1 " +
+        std::to_string(own_port) +
+        " " +
+        std::string(p1_pk_hex) +
+        " " +
+        std::string(hash_hex) +
+        "\n";
+
+    asio::write(
+        relay_socket,
+        asio::buffer(command)
+    );
+
+    asio::streambuf reg_buf;
+    std::error_code reg_error;
+
+    asio::read_until(
+        relay_socket,
+        reg_buf,
+        '\n',
+        reg_error
+    );
+
+    if (reg_error)
+        throw std::system_error(reg_error);
+
+    std::istream reg_is(&reg_buf);
+
+    std::string response;
+    std::getline(reg_is, response);
+
+    std::cout << "Relay server: "
+              << response << '\n';
+
+    // Registration connection is done with; let it close naturally when
+    // relay_socket goes out of scope. Each lookup below opens a fresh
+    // connection to the relay instead of reusing this one.
+
     tcp::acceptor acceptor(
         io,
         tcp::endpoint(tcp::v4(), own_port)
@@ -73,7 +193,7 @@ int main(int argc,char* argv[]) {
 
         std::cout << "Incoming connection on port "
                   << own_port
-                  <<"\n";
+                  << "\n";
 
         std::error_code error;
 
@@ -162,16 +282,43 @@ int main(int argc,char* argv[]) {
         std::cout << "Next hop HashId: "
                   << next_hash_hex << "\n";
 
-        // Connect to B
-        tcp::resolver resolver(io);
-        auto b_endpoints =
-            resolver.resolve(next_hop_ip,next_hop_port);
+        // Look up the next hop's ip/port from the relay using its hashid
+        Peer next_peer;
+        bool found;
 
-        tcp::socket b_socket(io);
+        try {
+            found = lookupPeerByHashId(
+                io,
+                relay_ip,
+                relay_port,
+                std::string(next_hash_hex),
+                next_peer
+            );
+        }
+        catch (const std::exception& e) {
+            std::cerr << "Relay lookup failed: " << e.what() << "\n";
+            continue;
+        }
+
+        if (!found) {
+            std::cerr << "Unknown next hop hashid, dropping packet: "
+                      << next_hash_hex << "\n";
+            continue;
+        }
+
+        std::cout << "Resolved next hop to "
+                  << next_peer.ip << ":" << next_peer.port << "\n";
+
+        // Connect to the resolved next hop
+        tcp::resolver next_resolver(io);
+        auto next_endpoints =
+            next_resolver.resolve(next_peer.ip, next_peer.port);
+
+        tcp::socket next_socket(io);
 
         asio::connect(
-            b_socket,
-            b_endpoints
+            next_socket,
+            next_endpoints
         );
 
         // Send remaining blob
@@ -179,19 +326,19 @@ int main(int argc,char* argv[]) {
         uint32_t out_len_net = htonl(out_len);
 
         asio::write(
-            b_socket,
+            next_socket,
             asio::buffer(&out_len_net, sizeof(out_len_net))
         );
 
         asio::write(
-            b_socket,
+            next_socket,
             asio::buffer(remaining_blob)
         );
 
         std::cout << "Forwarded packet to "
-                  << next_hop_ip
+                  << next_peer.ip
                   << ":"
-                  << next_hop_port
+                  << next_peer.port
                   << "\n";
     }
 

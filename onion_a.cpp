@@ -14,7 +14,6 @@ int main() {
         unsigned char a_pk[crypto_box_PUBLICKEYBYTES];
         unsigned char a_sk[crypto_box_SECRETKEYBYTES];
 
-        // Load or generate keypair
         std::ifstream keyfile_in("onion_a.key", std::ios::binary);
 
         if (keyfile_in) {
@@ -105,10 +104,6 @@ int main() {
 
         std::string message =
             "hello B, via P1 -> P2 -> P3";
-
-        // ------------------------
-        // Build plaintext for B
-        // ------------------------
 
         std::vector<unsigned char> plaintext_b;
 
@@ -209,13 +204,6 @@ int main() {
             plaintext_p1.size(),
             p1_pk
         );
-        // ------------------------
-        // Build plaintext for P1
-        // ------------------------
-
-        // ------------------------
-        // Send to P1
-        // ------------------------
 
         asio::io_context io;
 

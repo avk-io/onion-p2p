@@ -4,7 +4,7 @@
 
 using asio::ip::tcp;
 
-std::mutex peers_mutex;   // global, or pass by reference — your choice
+std::mutex peers_mutex;   
 
 std::string handleCommand(const std::string& line,
                           std::vector<Peer>& peers)
