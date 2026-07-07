@@ -48,12 +48,14 @@ target_include_directories(onion_b PRIVATE /home/caliz/chatNT/asio/include)
 target_compile_definitions(onion_b PRIVATE ASIO_STANDALONE)
 target_link_libraries(onion_b PRIVATE pthread sodium)
 
-add_executable(onion_p1 onion_p1.cpp)
-target_include_directories(onion_p1 PRIVATE /home/caliz/chatNT/asio/include)
-target_compile_definitions(onion_p1 PRIVATE ASIO_STANDALONE)
-target_link_libraries(onion_p1 PRIVATE pthread sodium)
+
 
 add_executable(onion_a onion_a.cpp)
 target_include_directories(onion_a PRIVATE /home/caliz/chatNT/asio/include)
 target_compile_definitions(onion_a PRIVATE ASIO_STANDALONE)
 target_link_libraries(onion_a PRIVATE pthread sodium)
+
+add_executable(onion_relay onion_relay.cpp)
+target_include_directories(onion_relay PRIVATE /home/caliz/chatNT/asio/include)
+target_compile_definitions(onion_relay PRIVATE ASIO_STANDALONE)
+target_link_libraries(onion_relay PRIVATE pthread sodium)

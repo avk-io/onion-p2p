@@ -6,7 +6,20 @@
 
 using asio::ip::tcp;
 
-int main() {
+int main(int argc,char* argv[]) {
+    if(argc!=5){
+        std::cerr
+            << "Usage: "
+            << argv[0]
+            << " <own_port> <own_keyfile> <next_hop_ip> <next_hop_port>\n";
+        return 1;
+    }
+    unsigned short own_port = std::stoi(argv[1]);
+
+    std::string own_keyfile = argv[2];
+    std::string next_hop_ip = argv[3];
+    std::string next_hop_port = argv[4];
+
     if (sodium_init() < 0)
         return 1;
 
@@ -14,7 +27,7 @@ int main() {
     unsigned char p1_sk[crypto_box_SECRETKEYBYTES];
 
     // Load or generate keypair
-    std::ifstream keyfile_in("onion_p1.key", std::ios::binary);
+    std::ifstream keyfile_in(own_keyfile, std::ios::binary);
 
     if (keyfile_in) {
         keyfile_in.read(reinterpret_cast<char*>(p1_pk), sizeof(p1_pk));
@@ -27,7 +40,7 @@ int main() {
     } else {
         crypto_box_keypair(p1_pk, p1_sk);
 
-        std::ofstream keyfile_out("onion_p1.key", std::ios::binary);
+        std::ofstream keyfile_out(own_keyfile, std::ios::binary);
         keyfile_out.write(reinterpret_cast<char*>(p1_pk), sizeof(p1_pk));
         keyfile_out.write(reinterpret_cast<char*>(p1_sk), sizeof(p1_sk));
 
@@ -45,20 +58,22 @@ int main() {
         sizeof(p1_pk)
     );
 
-    std::cout << "P1 Public Key:\n"
+    std::cout << "Node (" <<own_port<< ") Public Key:\n"
               << p1_pk_hex << "\n";
 
     asio::io_context io;
     tcp::acceptor acceptor(
         io,
-        tcp::endpoint(tcp::v4(), 7100)
+        tcp::endpoint(tcp::v4(), own_port)
     );
 
     for (;;) {
         tcp::socket socket(io);
         acceptor.accept(socket);
 
-        std::cout << "A connected\n";
+        std::cout << "Incoming connection on port "
+                  << own_port
+                  <<"\n";
 
         std::error_code error;
 
@@ -144,13 +159,13 @@ int main() {
             sizeof(next_hashid)
         );
 
-        std::cout << "Next hop hash: "
+        std::cout << "Next hop HashId: "
                   << next_hash_hex << "\n";
 
         // Connect to B
         tcp::resolver resolver(io);
         auto b_endpoints =
-            resolver.resolve("127.0.0.1", "7200");
+            resolver.resolve(next_hop_ip,next_hop_port);
 
         tcp::socket b_socket(io);
 
@@ -160,7 +175,7 @@ int main() {
         );
 
         // Send remaining blob
-        uint32_t out_len = remaining_blob.size();
+        uint32_t out_len = static_cast<uint32_t>(remaining_blob.size());
         uint32_t out_len_net = htonl(out_len);
 
         asio::write(
@@ -173,7 +188,11 @@ int main() {
             asio::buffer(remaining_blob)
         );
 
-        std::cout << "Forwarded to B\n";
+        std::cout << "Forwarded packet to "
+                  << next_hop_ip
+                  << ":"
+                  << next_hop_port
+                  << "\n";
     }
 
     return 0;
