@@ -310,7 +310,8 @@ int main(int argc, char* argv[]) {
                   << next_peer.ip << ":" << next_peer.port << "\n";
 
         // Connect to the resolved next hop
-        tcp::resolver next_resolver(io);
+        try{
+            tcp::resolver next_resolver(io);
         auto next_endpoints =
             next_resolver.resolve(next_peer.ip, next_peer.port);
 
@@ -340,6 +341,12 @@ int main(int argc, char* argv[]) {
                   << ":"
                   << next_peer.port
                   << "\n";
+        }catch(const std::exception& e){
+            std::cerr << "Failed to forward to next hop (" << next_peer.ip << ":" << next_peer.port <<"): "
+                     << e.what() << " --dropping packet,staying alive\n";
+            
+            continue;
+        }
     }
 
     return 0;

@@ -59,3 +59,16 @@ add_executable(onion_relay onion_relay.cpp)
 target_include_directories(onion_relay PRIVATE /home/caliz/chatNT/asio/include)
 target_compile_definitions(onion_relay PRIVATE ASIO_STANDALONE)
 target_link_libraries(onion_relay PRIVATE pthread sodium)
+
+add_executable(tui_test tui_test.cpp)
+target_link_libraries(tui_test PRIVATE ncurses)
+
+add_executable(tui_layout tui_layout.cpp)
+target_include_directories(tui_layout PRIVATE /home/caliz/chatNT/asio/include)
+target_compile_definitions(tui_layout PRIVATE ASIO_STANDALONE)
+target_link_libraries(tui_layout PRIVATE ncurses sodium pthread)
+
+add_executable(onion_chat onion_chat.cpp)
+target_include_directories(onion_chat PRIVATE /home/caliz/chatNT/asio/include)
+target_compile_definitions(onion_chat PRIVATE ASIO_STANDALONE)
+target_link_libraries(onion_chat PRIVATE ncurses sodium pthread)
