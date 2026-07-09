@@ -17,7 +17,7 @@ std::string handleCommand(const std::string& line,
     if (command == "REGISTER") {
         Peer peer;
 
-        if (!(iss >> peer.ip >> peer.port >> peer.pubkey >> peer.hashid))
+        if (!(iss >> peer.ip >> peer.port >> peer.pubkey >> peer.hashid >> peer.can_relay))
             return "ERROR Invalid REGISTER command\n";
 
         peers.push_back(peer);
@@ -32,7 +32,8 @@ std::string handleCommand(const std::string& line,
             out << peer.ip << " "
                 << peer.port << " "
                 << peer.pubkey << " "
-                << peer.hashid << "\n";
+                << peer.hashid << " "
+                << peer.can_relay << "\n";
         }
 
         return out.str();

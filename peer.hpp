@@ -6,5 +6,6 @@ struct Peer{
     std::string port;
     std::string pubkey;
     std::string hashid;
+    bool can_relay;
 };
 
