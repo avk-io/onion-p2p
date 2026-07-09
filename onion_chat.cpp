@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <random>
-
+#include <chrono>
 #include "peer.hpp"
 
 #include <sodium.h>
@@ -31,6 +31,8 @@ std::string g_recipient_port;
 std::string g_relay_ip;
 std::string g_relay_port;
 bool g_recipient_found = false;
+std::mutex peers_mutex;
+std::vector<Peer> g_peers;
 
 // Connects to the relay, sends LIST, parses the count-prefixed response
 // into a vector of Peer entries.
@@ -379,6 +381,22 @@ void networkThread() {
     }
 }
 
+void peerRefreshThread() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+
+        try {
+            asio::io_context io;
+            std::vector<Peer> fresh = fetchPeerList(io, g_relay_ip, g_relay_port);
+
+            std::lock_guard<std::mutex> lock(peers_mutex);
+            g_peers = fresh;
+        }
+        catch (...) {
+            // relay temporarily unreachable; just try again next cycle
+        }
+    }
+}
 // Sends a plaintext message to the resolved recipient, sealed with their
 // public key. Single layer -- no onion routing here, just direct P2P,
 // same pattern as peer_a.cpp but using crypto_box_seal instead of
@@ -469,7 +487,7 @@ int main(int argc, char* argv[]) {
     std::vector<Peer> peers;
     try {
         asio::io_context io;
-        peers = fetchPeerList(io, relay_ip, relay_port);
+        g_peers = fetchPeerList(io, relay_ip, relay_port);
     }
     catch (const std::exception& e) {
         std::cerr << "Failed to fetch peer list: " << e.what() << "\n";
@@ -477,7 +495,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Resolve the recipient from the fetched list.
-    for (const auto& p : peers) {
+    for (const auto& p : g_peers) {
         if (p.hashid == recipient_hashid) {
             g_recipient_ip = p.ip;
             g_recipient_port = p.port;
@@ -526,6 +544,8 @@ int main(int argc, char* argv[]) {
     // Start the network thread (listens for incoming messages)
     std::thread net_thread(networkThread);
     net_thread.detach();
+    std::thread refresh_thread(peerRefreshThread);
+    refresh_thread.detach();
 
     initscr();
     cbreak();
@@ -571,15 +591,7 @@ int main(int argc, char* argv[]) {
     mvwprintw(help_win, 2, 2, "Enter - send message");
     mvwprintw(help_win, 3, 2, "Ctrl+C - quit");
 
-    int peer_inner_h = peer_h - 2;
-    int peer_inner_w = left_w - 4;
-
-    for (size_t i = 0; i < peers.size() && (int)i < peer_inner_h - 1; i++) {
-        std::string display = peers[i].hashid;
-        if ((int)display.size() > peer_inner_w)
-            display = display.substr(0, peer_inner_w);
-        mvwprintw(peer_win, 2 + (int)i, 2, "%s", display.c_str());
-    }
+    
 
     std::string input_buffer;
 
@@ -588,9 +600,25 @@ int main(int argc, char* argv[]) {
         box(chat_win, 0, 0);
         mvwprintw(chat_win, 0, 2, " Chat ");
 
+        werase(peer_win);
+        box(peer_win,0,0);
+        mvwprintw(peer_win,0,2,"Peer List");
+
+        {
+            std::lock_guard<std::mutex> lock(peers_mutex);
+
+            int peer_inner_h = peer_h - 2;
+            int peer_inner_w = left_w - 4;
+
+            for (size_t i = 0; i < g_peers.size() && (int)i < peer_inner_h - 1; i++) {
+                std::string display = g_peers[i].hashid;
+                if ((int)display.size() > peer_inner_w)
+                    display = display.substr(0, peer_inner_w);
+                mvwprintw(peer_win, 2 + (int)i, 2, "%s", display.c_str());
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(chat_mutex);
-
             int max_lines = getmaxy(chat_win) - 3;
             int start = std::max(0, (int)chat_lines.size() - max_lines);
 
