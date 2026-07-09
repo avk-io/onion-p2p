@@ -455,6 +455,9 @@ int main(int argc, char* argv[]) {
     g_relay_ip = relay_ip;
     g_relay_port = relay_port;
     bool can_relay_flag = (std::string(argv[5]) == "1");
+    bool focus_on_peers = false;
+    int selected_peer_index = 0;
+    std::string current_recipient = recipient_hashid;
 
     if (sodium_init() < 0) return 1;
 
@@ -570,7 +573,6 @@ int main(int argc, char* argv[]) {
     int help_h = chat_h - relay_h;
 
     mvprintw(0, 1, "Your hash id: %s", hash_hex);
-    mvprintw(1, 1, "Chatting with: %s", recipient_hashid.substr(0, 16).c_str());
 
     WINDOW* chat_win  = newwin(chat_h, left_w, header_h, 0);
     WINDOW* peer_win  = newwin(peer_h, left_w, header_h + chat_h, 0);
@@ -600,6 +602,8 @@ int main(int argc, char* argv[]) {
         box(chat_win, 0, 0);
         mvwprintw(chat_win, 0, 2, " Chat ");
 
+        mvprintw(1, 1, "Chatting with: %s", current_recipient.substr(0, 16).c_str());
+
         werase(peer_win);
         box(peer_win,0,0);
         mvwprintw(peer_win,0,2,"Peer List");
@@ -614,7 +618,14 @@ int main(int argc, char* argv[]) {
                 std::string display = g_peers[i].hashid;
                 if ((int)display.size() > peer_inner_w)
                     display = display.substr(0, peer_inner_w);
-                mvwprintw(peer_win, 2 + (int)i, 2, "%s", display.c_str());
+                
+                if(focus_on_peers && (int)i == selected_peer_index){
+                    wattron(peer_win,A_REVERSE);
+                    mvwprintw(peer_win,2 + (int)i , 2,"%s",display.c_str());
+                    wattroff(peer_win,A_REVERSE);
+                }else{
+                    mvwprintw(peer_win,2 + (int)i,2,"%s",display.c_str());
+                }
             }
         }
         {
@@ -640,22 +651,40 @@ int main(int argc, char* argv[]) {
 
         int ch = getch();
 
-        if (ch == ERR) {
+        if(ch==ERR){
             continue;
         }
-        else if (ch == '\n') {
-            if (!input_buffer.empty()) {
-                sendOnionMessage(recipient_hashid,input_buffer);
-                input_buffer.clear();
+
+        else if(ch=='\t'){
+            focus_on_peers = !focus_on_peers;
+        }
+        else if(focus_on_peers){
+            std::lock_guard<std::mutex> lock(peers_mutex);
+            if(ch==KEY_UP){
+                if(selected_peer_index > 0) selected_peer_index--;
+            }else if(ch==KEY_DOWN){
+                if(selected_peer_index < (int)g_peers.size()-1) selected_peer_index++;
+            }else if(ch=='\n'){
+                if(selected_peer_index < (int)g_peers.size()){
+                    current_recipient = g_peers[selected_peer_index].hashid;
+                    focus_on_peers = false;
+                }
+            }else if(ch == 24){
+                break;
             }
-        }
-        else if (ch == KEY_BACKSPACE || ch == 127) {
-            if (!input_buffer.empty()) input_buffer.pop_back();
-        }
-        else if (isprint(ch)) {
-            input_buffer += (char)ch;
-        }else if(ch==24){
-            break;
+        }else{
+            if(ch=='\n'){
+                if(!input_buffer.empty()){
+                    sendOnionMessage(current_recipient,input_buffer);
+                    input_buffer.clear();
+                }
+            }else if(ch==KEY_BACKSPACE || ch==127){
+                if(!input_buffer.empty()) input_buffer.pop_back();
+            }else if(isprint(ch)){
+                input_buffer += char(ch);
+            }else if(ch==24){
+                break;
+            }
         }
     }
 
