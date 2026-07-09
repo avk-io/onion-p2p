@@ -20,6 +20,12 @@ std::string handleCommand(const std::string& line,
         if (!(iss >> peer.ip >> peer.port >> peer.pubkey >> peer.hashid >> peer.can_relay))
             return "ERROR Invalid REGISTER command\n";
 
+        for(auto& existing : peers){
+            if(existing.hashid == peer.hashid){
+                existing = peer;
+                return "OK registered(updated)\n";
+            }
+        }
         peers.push_back(peer);
         return "OK Registered\n";
     }
