@@ -72,3 +72,17 @@ add_executable(onion_chat onion_chat.cpp)
 target_include_directories(onion_chat PRIVATE /home/caliz/chatNT/asio/include)
 target_compile_definitions(onion_chat PRIVATE ASIO_STANDALONE)
 target_link_libraries(onion_chat PRIVATE ncurses sodium pthread)
+
+add_executable(daemon_test daemon_test.cpp)
+target_include_directories(daemon_test PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+target_link_libraries(daemon_test PRIVATE pthread)
+
+add_executable(relay_http relay_http.cpp)
+target_include_directories(relay_http PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+target_link_libraries(relay_http PRIVATE pthread sodium)
+
+add_executable(make_test_packet make_test_packet.cpp)
+target_link_libraries(make_test_packet PRIVATE sodium)
+
+add_executable(make_test_packet2 make_test_packet2.cpp)
+target_link_libraries(make_test_packet2 PRIVATE sodium)
