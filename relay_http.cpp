@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <mutex>
 #include <cstdio>
 
 bool load_or_generate_keypair(
@@ -40,11 +41,10 @@ bool load_or_generate_keypair(
 }
 
 // Temporary hardcoded relay directory: hashid (hex) -> {ip, port}.
-// Fill this in once you know the real hashids of your other relay_http
-// instances. Real version later reads this from a config file instead.
+// Real version later reads this from a config file instead.
 
 std::mutex mailbox_mutex;
-std::map<std::string,std::vector<std::string>> mailbox;
+std::map<std::string, std::vector<std::string>> mailbox;
 
 struct RelayAddr { std::string ip; std::string port; };
 std::map<std::string, RelayAddr> relay_directory = {
@@ -90,43 +90,28 @@ int main(int argc, char* argv[]) {
 
     httplib::Server svr;
 
-    svr.Post("/mailbox/deliver", [&](const httplib::Request& req, httplib::Response& res){
-        auto recipient_hashid = req.get_header_value("X-Recipient-Hashid");
+    svr.Get(R"(/mailbox/([a-f0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
+        std::string hashid = req.matches[1];
 
-        if(recipient_hashid.empty()){
-            res.status = 400;
-            res.set_content("Missing X-Recipient-Hashid header","text/plain");
+        std::lock_guard<std::mutex> lock(mailbox_mutex);
+
+        auto it = mailbox.find(hashid);
+        if (it == mailbox.end() || it->second.empty()) {
+            res.status = 200;
+            res.set_content("[]", "application/json");
             return;
         }
-        std::lock_guard<std::mutex> lock(mailbox_mutex);
-        mailbox[recipient_hashid].push_back(req.body);
 
-        res.status = 200;
-        res.set_content("Stored", "text/plain");
+        std::string json = "[";
+        for (size_t i = 0; i < it->second.size(); i++) {
+            if (i > 0) json += ",";
+            json += "\"" + it->second[i] + "\"";
+        }
+        json += "]";
+
+        res.set_content(json, "application/json");
+        it->second.clear();   // mark as delivered
     });
-
-    svr.Get(R"(/mailbox/([a-f0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
-    std::string hashid = req.matches[1];
-
-    std::lock_guard<std::mutex> lock(mailbox_mutex);
-
-    auto it = mailbox.find(hashid);
-    if (it == mailbox.end() || it->second.empty()) {
-        res.status = 200;
-        res.set_content("[]", "application/json");
-        return;
-    }
-
-    std::string json = "[";
-    for (size_t i = 0; i < it->second.size(); i++) {
-        if (i > 0) json += ",";
-        json += "\"" + it->second[i] + "\"";
-    }
-    json += "]";
-
-    res.set_content(json, "application/json");
-    it->second.clear();   // mark as delivered
-});
 
     svr.Post("/relay/deliver",
              [&](const httplib::Request& req, httplib::Response& res) {
@@ -212,20 +197,19 @@ int main(int argc, char* argv[]) {
         std::cout << "Remaining Payload: " << remaining.size() << " bytes\n";
 
         // -------------------------------
-        // Forward or terminate
+        // Forward to a known relay, or deliver to mailbox if next_hashid
+        // isn't a relay we know about (meaning it's an ordinary recipient).
+        //
+        // Every layer a relay successfully peels is always layer_type
+        // 0x00 (relay-forward) -- the final layer is sealed for the
+        // RECIPIENT's key, not any relay's, so a relay can never
+        // successfully open it. There is no separate 0x01 case to
+        // handle here.
         // -------------------------------
-        if (layer_type == 0x00) {
-            // Middle-hop layer: look up next_hashid, forward `remaining`
-            // (still sealed) onward.
-            auto it = relay_directory.find(next_hashid_hex);
-            if (it == relay_directory.end()) {
-                std::cout << "Unknown next hop, dropping packet\n";
-                std::cout << "================================\n";
-                res.status = 502;
-                res.set_content("Unknown next hop", "text/plain");
-                return;
-            }
+        auto it = relay_directory.find(next_hashid_hex);
 
+        if (it != relay_directory.end()) {
+            // Known relay -- forward the still-sealed blob onward, unchanged.
             size_t fwd_b64_len = sodium_base64_ENCODED_LEN(
                 remaining.size(), sodium_base64_VARIANT_ORIGINAL);
             std::vector<char> fwd_b64(fwd_b64_len);
@@ -250,38 +234,25 @@ int main(int argc, char* argv[]) {
 
             std::cout << "Forwarded to " << it->second.ip << ":" << it->second.port << "\n";
         }
-        else if (layer_type == 0x01) {
-
-            if(remaining.size()<32){
-                std::cout<< "Malformed final layer(too short for recipient hashid)\n";
-                std::cout<< "================================\n";
-                res.status = 400;
-                res.set_content("Malformed final layer", "text/plain");
-                return;
-            }
-            std::vector<unsigned char> recipient_hashid_bytes(remaining.begin(), remaining.begin() + 32);
-            std::vector<unsigned char> message_bytes(remaining.begin() + 32, remaining.end());
-
-            char recipient_hashid_hex[65];
-            for(size_t i = 0;i<recipient_hashid_bytes.size();i++){
-                std::snprintf(recipient_hashid_hex + i *2,3, "%02x",recipient_hashid_bytes[i]);
-            }
-            recipient_hashid_hex[64] = '\0';
-
-            std::vector<unsigned char> mailbox_payload;
-            mailbox_payload.insert(mailbox_payload.end(),next_hashid.begin(),next_hashid.end());
-            mailbox_payload.insert(mailbox_payload.end(),message_bytes.begin(),message_bytes.end());
-
-            size_t mb_b64_len = sodium_base64_ENCODED_LEN(mailbox_payload.size(),sodium_base64_VARIANT_ORIGINAL);
+        else {
+            // Not a known relay -- must be an ordinary recipient. Store
+            // the still-sealed blob directly in our local mailbox.
+            size_t mb_b64_len = sodium_base64_ENCODED_LEN(
+                remaining.size(), sodium_base64_VARIANT_ORIGINAL);
             std::vector<char> mb_b64(mb_b64_len);
-            sodium_bin2base64(mb_b64.data(),mb_b64.size(),mailbox_payload.data(),mailbox_payload.size(),sodium_base64_VARIANT_ORIGINAL);
+
+            sodium_bin2base64(
+                mb_b64.data(), mb_b64.size(),
+                remaining.data(), remaining.size(),
+                sodium_base64_VARIANT_ORIGINAL
+            );
 
             {
                 std::lock_guard<std::mutex> lock(mailbox_mutex);
-                mailbox[recipient_hashid_hex].push_back(mb_b64.data());
+                mailbox[next_hashid_hex].push_back(mb_b64.data());
             }
-            std::cout<< "Delivered to mailbox for " << recipient_hashid_hex << "\n";
 
+            std::cout << "Delivered to mailbox for " << next_hashid_hex << "\n";
         }
 
         std::cout << "================================\n";
