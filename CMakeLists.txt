@@ -92,3 +92,13 @@ target_include_directories(daemon PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
 target_link_libraries(daemon PRIVATE pthread sodium)
 
 target_link_libraries(relay_http PRIVATE pthread sodium sqlite3)
+
+find_package(OpenSSL REQUIRED)
+
+target_compile_definitions(relay_http PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+target_link_libraries(relay_http PRIVATE pthread sodium sqlite3 OpenSSL::SSL OpenSSL::Crypto)
+
+find_package(OpenSSL REQUIRED)
+
+target_compile_definitions(daemon PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+target_link_libraries(daemon PRIVATE pthread sodium sqlite3 OpenSSL::SSL OpenSSL::Crypto)

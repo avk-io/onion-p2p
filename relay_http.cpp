@@ -1,6 +1,6 @@
+#define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
 #include <sodium.h>
-
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -159,7 +159,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Relay pubkey: " << pk_hex << "\n";
     std::cout << "Relay hashid: " << hash_hex << "\n";
 
-    httplib::Server svr;
+    httplib::SSLServer svr("relay.crt","relay.key");
 
     svr.Get(R"(/mailbox/([a-f0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
         std::string hashid = req.matches[1];
@@ -283,7 +283,8 @@ int main(int argc, char* argv[]) {
                 sodium_base64_VARIANT_ORIGINAL
             );
 
-            httplib::Client next_hop_client(it->second.ip, std::stoi(it->second.port));
+            httplib::SSLClient next_hop_client(it->second.ip, std::stoi(it->second.port));
+            next_hop_client.enable_server_certificate_verification(false);
             auto fwd_res = next_hop_client.Post("/relay/deliver", fwd_b64.data(), "text/plain");
 
             if (!fwd_res || fwd_res->status != 200) {

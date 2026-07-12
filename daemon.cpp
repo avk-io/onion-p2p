@@ -1,6 +1,6 @@
+#define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
 #include <sodium.h>
-
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -113,7 +113,7 @@ int main(int argc, char* argv[]) {
     crypto_generichash(g_hash, sizeof(g_hash), g_pk, sizeof(g_pk), nullptr, 0);
     sodium_bin2hex(g_hash_hex, sizeof(g_hash_hex), g_hash, sizeof(g_hash));
 
-    httplib::Server svr;
+    httplib::SSLServer svr("relay.crt","relay.key");
 
     svr.Get("/identity", [&](const httplib::Request&, httplib::Response& res) {
         std::string json =
@@ -126,7 +126,8 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> decrypted_messages;   // will hold formatted "sender: message" strings
 
     for (const auto& relay : known_relays) {
-        httplib::Client relay_client(relay.ip, std::stoi(relay.port));
+        httplib::SSLClient relay_client(relay.ip, std::stoi(relay.port));
+        relay_client.enable_server_certificate_verification(false);
         auto mailbox_res = relay_client.Get(("/mailbox/" + std::string(g_hash_hex)).c_str());
 
       
@@ -296,7 +297,8 @@ int main(int argc, char* argv[]) {
         std::vector<char> b64(b64_len);
         sodium_bin2base64(b64.data(), b64.size(), sealed_r1.data(), sealed_r1.size(), sodium_base64_VARIANT_ORIGINAL);
 
-        httplib::Client relay_client(r1.ip, std::stoi(r1.port));
+        httplib::SSLClient relay_client(r1.ip, std::stoi(r1.port));
+        relay_client.enable_server_certificate_verification(false);
         auto relay_res = relay_client.Post("/relay/deliver", b64.data(), "text/plain");
 
         if (!relay_res || relay_res->status != 200) {
