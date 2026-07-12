@@ -90,3 +90,5 @@ target_link_libraries(make_test_packet2 PRIVATE sodium)
 add_executable(daemon daemon.cpp)
 target_include_directories(daemon PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
 target_link_libraries(daemon PRIVATE pthread sodium)
+
+target_link_libraries(relay_http PRIVATE pthread sodium sqlite3)

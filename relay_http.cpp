@@ -9,6 +9,74 @@
 #include <map>
 #include <mutex>
 #include <cstdio>
+#include <sqlite3.h>
+
+sqlite3* db = nullptr;
+
+bool init_db(const std::string& path) {
+    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) {
+        std::cerr << "Failed to open database: " << sqlite3_errmsg(db) << "\n";
+        return false;
+    }
+
+    const char* create_sql =
+        "CREATE TABLE IF NOT EXISTS mailbox ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "recipient_hashid TEXT NOT NULL,"
+        "payload_b64 TEXT NOT NULL,"
+        "created_at INTEGER NOT NULL"
+        ");";
+
+    char* err_msg = nullptr;
+    if (sqlite3_exec(db, create_sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        std::cerr << "Failed to create table: " << err_msg << "\n";
+        sqlite3_free(err_msg);
+        return false;
+    }
+
+    return true;
+}
+
+bool mailbox_store(const std::string& recipient_hashid, const std::string& payload_b64) {
+    const char* sql = "INSERT INTO mailbox (recipient_hashid, payload_b64, created_at) VALUES (?, ?, ?);";
+
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+
+    sqlite3_bind_text(stmt, 1, recipient_hashid.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, payload_b64.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)time(nullptr));
+
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+std::vector<std::string> mailbox_fetch_and_clear(const std::string& recipient_hashid) {
+    std::vector<std::string> results;
+
+    const char* select_sql = "SELECT payload_b64 FROM mailbox WHERE recipient_hashid = ?;";
+    sqlite3_stmt* stmt;
+
+    if (sqlite3_prepare_v2(db, select_sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, recipient_hashid.c_str(), -1, SQLITE_TRANSIENT);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const unsigned char* text = sqlite3_column_text(stmt, 0);
+            results.push_back(reinterpret_cast<const char*>(text));
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    const char* delete_sql = "DELETE FROM mailbox WHERE recipient_hashid = ?;";
+    if (sqlite3_prepare_v2(db, delete_sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, recipient_hashid.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(stmt);
+    }
+    sqlite3_finalize(stmt);
+
+    return results;
+}
 
 bool load_or_generate_keypair(
     const std::string& path,
@@ -43,8 +111,6 @@ bool load_or_generate_keypair(
 // Temporary hardcoded relay directory: hashid (hex) -> {ip, port}.
 // Real version later reads this from a config file instead.
 
-std::mutex mailbox_mutex;
-std::map<std::string, std::vector<std::string>> mailbox;
 
 struct RelayAddr { std::string ip; std::string port; };
 std::map<std::string, RelayAddr> relay_directory = {
@@ -76,6 +142,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    if (!init_db("relay_mailbox_" + std::to_string(http_port) + ".db")) {
+        std::cerr << "Failed to initialize mailbox database\n";
+        return 1;
+    }
+
     char pk_hex[crypto_box_PUBLICKEYBYTES * 2 + 1];
     sodium_bin2hex(pk_hex, sizeof(pk_hex), pk, sizeof(pk));
 
@@ -93,24 +164,16 @@ int main(int argc, char* argv[]) {
     svr.Get(R"(/mailbox/([a-f0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
         std::string hashid = req.matches[1];
 
-        std::lock_guard<std::mutex> lock(mailbox_mutex);
-
-        auto it = mailbox.find(hashid);
-        if (it == mailbox.end() || it->second.empty()) {
-            res.status = 200;
-            res.set_content("[]", "application/json");
-            return;
-        }
+        std::vector<std::string> results = mailbox_fetch_and_clear(hashid);
 
         std::string json = "[";
-        for (size_t i = 0; i < it->second.size(); i++) {
+        for (size_t i = 0; i < results.size(); i++) {
             if (i > 0) json += ",";
-            json += "\"" + it->second[i] + "\"";
+            json += "\"" + results[i] + "\"";
         }
         json += "]";
 
         res.set_content(json, "application/json");
-        it->second.clear();   // mark as delivered
     });
 
     svr.Post("/relay/deliver",
@@ -247,10 +310,9 @@ int main(int argc, char* argv[]) {
                 sodium_base64_VARIANT_ORIGINAL
             );
 
-            {
-                std::lock_guard<std::mutex> lock(mailbox_mutex);
-                mailbox[next_hashid_hex].push_back(mb_b64.data());
-            }
+          {
+            mailbox_store(next_hashid_hex,mb_b64.data());
+          }
 
             std::cout << "Delivered to mailbox for " << next_hashid_hex << "\n";
         }
