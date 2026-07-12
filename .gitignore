@@ -1,2 +1,5 @@
 build/
 *.o
+*.key
+*.db
+tui_layout
