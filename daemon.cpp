@@ -122,6 +122,74 @@ int main(int argc, char* argv[]) {
         res.set_content(json, "application/json");
     });
 
+    svr.Get("/inbox", [&](const httplib::Request&, httplib::Response& res) {
+    std::vector<std::string> decrypted_messages;   // will hold formatted "sender: message" strings
+
+    for (const auto& relay : known_relays) {
+        httplib::Client relay_client(relay.ip, std::stoi(relay.port));
+        auto mailbox_res = relay_client.Get(("/mailbox/" + std::string(g_hash_hex)).c_str());
+
+      
+        if (!mailbox_res || mailbox_res->status != 200) continue;
+
+        // Very simple manual parse of a JSON array of quoted strings:
+        // ["abc==","def=="]  ->  {"abc==", "def=="}
+        const std::string& body = mailbox_res->body;
+        size_t pos = 1;   // skip leading '['
+        while (pos < body.size() && body[pos] != ']') {
+            if (body[pos] == '"') {
+                size_t end = body.find('"', pos + 1);
+                if (end == std::string::npos) break;
+
+                std::string b64_payload = body.substr(pos + 1, end - pos - 1);
+                pos = end + 1;
+
+                // decode + decrypt this one payload
+                std::vector<unsigned char> sealed(b64_payload.size());
+                size_t decoded_len = 0;
+                if (sodium_base642bin(
+                        sealed.data(), sealed.size(),
+                        b64_payload.c_str(), b64_payload.size(),
+                        nullptr, &decoded_len, nullptr,
+                        sodium_base64_VARIANT_ORIGINAL) != 0) {
+                    continue;
+                }
+                sealed.resize(decoded_len);
+
+                if (sealed.size() < crypto_box_SEALBYTES) continue;
+
+                std::vector<unsigned char> plaintext(sealed.size() - crypto_box_SEALBYTES);
+                if (crypto_box_seal_open(plaintext.data(), sealed.data(), sealed.size(), g_pk, g_sk) != 0) {
+                    continue;   // not actually for us, or corrupted
+                }
+
+                if (plaintext.size() < 1 + crypto_generichash_BYTES*2) continue;
+
+                char sender_hex[crypto_generichash_BYTES * 2 + 1];
+                sodium_bin2hex(sender_hex, sizeof(sender_hex), plaintext.data()+1, crypto_generichash_BYTES);
+
+                std::string message(
+                    reinterpret_cast<char*>(plaintext.data()+ 1 + crypto_generichash_BYTES*2),
+                    plaintext.size() - 1 - crypto_generichash_BYTES*2
+                );
+
+                decrypted_messages.push_back(std::string(sender_hex) + ": " + message);
+            } else {
+                pos++;
+            }
+        }
+    }
+
+    std::string json = "[";
+    for (size_t i = 0; i < decrypted_messages.size(); i++) {
+        if (i > 0) json += ",";
+        json += "\"" + decrypted_messages[i] + "\"";
+    }
+    json += "]";
+
+    res.set_content(json, "application/json");
+});
+
     svr.Post("/send", [&](const httplib::Request& req, httplib::Response& res) {
         std::string recipient_hashid, recipient_pubkey_hex, message;
 
