@@ -10,6 +10,9 @@
 #include <mutex>
 #include <cstdio>
 #include <sqlite3.h>
+#include <chrono>
+#include <unordered_map>
+#include <algorithm>
 
 sqlite3* db = nullptr;
 
@@ -37,6 +40,31 @@ bool init_db(const std::string& path) {
     return true;
 }
 
+std::mutex rate_limit_mutex;
+std::unordered_map<std::string,std::vector<std::chrono::steady_clock::time_point>> request_log;
+
+const int RATE_LIMIT_MAX_REQUESTS = 20;
+const int RATE_LIMIT_WINDOW_SECONDS = 10;
+
+bool is_rate_limited(const std::string& client_ip){
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(rate_limit_mutex);
+
+    auto& timestamps = request_log[client_ip];
+
+    timestamps.erase(
+        std::remove_if(timestamps.begin(),timestamps.end(),
+            [&](const auto& t){
+                return std::chrono::duration_cast<std::chrono::seconds>(now-t).count() > RATE_LIMIT_WINDOW_SECONDS;
+            }),
+        timestamps.end()
+    );
+    if(timestamps.size()>=RATE_LIMIT_MAX_REQUESTS){
+        return true;
+    }
+    timestamps.push_back(now);
+    return false;
+}
 bool mailbox_store(const std::string& recipient_hashid, const std::string& payload_b64) {
     const char* sql = "INSERT INTO mailbox (recipient_hashid, payload_b64, created_at) VALUES (?, ?, ?);";
 
@@ -179,6 +207,11 @@ int main(int argc, char* argv[]) {
     svr.Post("/relay/deliver",
              [&](const httplib::Request& req, httplib::Response& res) {
 
+                if(is_rate_limited(req.remote_addr)){
+                    res.status = 429;
+                    res.set_content("Too many requests","text/plain");
+                    return;
+                }
         // -------------------------------
         // Decode Base64
         // -------------------------------
