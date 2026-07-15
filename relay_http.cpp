@@ -13,12 +13,21 @@
 #include <chrono>
 #include <unordered_map>
 #include <algorithm>
+#include <ctime>
+
+void log(const std::string& level, const std::string& message) {
+    std::time_t now = std::time(nullptr);
+    char timebuf[32];
+    std::strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+
+    std::cout << "[" << timebuf << "] [" << level << "] " << message << "\n";
+}
 
 sqlite3* db = nullptr;
 
 bool init_db(const std::string& path) {
     if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) {
-        std::cerr << "Failed to open database: " << sqlite3_errmsg(db) << "\n";
+        log("ERROR", std::string("Failed to open database: ") + sqlite3_errmsg(db));
         return false;
     }
 
@@ -32,7 +41,7 @@ bool init_db(const std::string& path) {
 
     char* err_msg = nullptr;
     if (sqlite3_exec(db, create_sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        std::cerr << "Failed to create table: " << err_msg << "\n";
+        log("ERROR", std::string("Failed to create table: ") + err_msg);
         sqlite3_free(err_msg);
         return false;
     }
@@ -41,30 +50,31 @@ bool init_db(const std::string& path) {
 }
 
 std::mutex rate_limit_mutex;
-std::unordered_map<std::string,std::vector<std::chrono::steady_clock::time_point>> request_log;
+std::unordered_map<std::string, std::vector<std::chrono::steady_clock::time_point>> request_log;
 
 const int RATE_LIMIT_MAX_REQUESTS = 20;
 const int RATE_LIMIT_WINDOW_SECONDS = 10;
 
-bool is_rate_limited(const std::string& client_ip){
+bool is_rate_limited(const std::string& client_ip) {
     auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(rate_limit_mutex);
 
     auto& timestamps = request_log[client_ip];
 
     timestamps.erase(
-        std::remove_if(timestamps.begin(),timestamps.end(),
-            [&](const auto& t){
-                return std::chrono::duration_cast<std::chrono::seconds>(now-t).count() > RATE_LIMIT_WINDOW_SECONDS;
+        std::remove_if(timestamps.begin(), timestamps.end(),
+            [&](const auto& t) {
+                return std::chrono::duration_cast<std::chrono::seconds>(now - t).count() > RATE_LIMIT_WINDOW_SECONDS;
             }),
         timestamps.end()
     );
-    if(timestamps.size()>=RATE_LIMIT_MAX_REQUESTS){
+    if (timestamps.size() >= RATE_LIMIT_MAX_REQUESTS) {
         return true;
     }
     timestamps.push_back(now);
     return false;
 }
+
 bool mailbox_store(const std::string& recipient_hashid, const std::string& payload_b64) {
     const char* sql = "INSERT INTO mailbox (recipient_hashid, payload_b64, created_at) VALUES (?, ?, ?);";
 
@@ -139,7 +149,6 @@ bool load_or_generate_keypair(
 // Temporary hardcoded relay directory: hashid (hex) -> {ip, port}.
 // Real version later reads this from a config file instead.
 
-
 struct RelayAddr { std::string ip; std::string port; };
 std::map<std::string, RelayAddr> relay_directory = {
     { "f58bc6eaad5b76449451abcd2c079b3b171f2ae82d65f73cbcedc22e3968de08", {"127.0.0.1", "8081"} },
@@ -149,8 +158,7 @@ std::map<std::string, RelayAddr> relay_directory = {
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
-        std::cerr << "Usage: " << argv[0]
-                  << " <http_port> <keyfile>\n";
+        log("ERROR", std::string("Usage: ") + argv[0] + " <http_port> <keyfile>");
         return 1;
     }
 
@@ -158,7 +166,7 @@ int main(int argc, char* argv[]) {
     std::string keyfile_path = argv[2];
 
     if (sodium_init() < 0) {
-        std::cerr << "Failed to initialize libsodium\n";
+        log("ERROR", "Failed to initialize libsodium");
         return 1;
     }
 
@@ -166,12 +174,12 @@ int main(int argc, char* argv[]) {
     unsigned char sk[crypto_box_SECRETKEYBYTES];
 
     if (!load_or_generate_keypair(keyfile_path, pk, sk)) {
-        std::cerr << "Failed to load/generate keypair\n";
+        log("ERROR", "Failed to load/generate keypair");
         return 1;
     }
 
     if (!init_db("relay_mailbox_" + std::to_string(http_port) + ".db")) {
-        std::cerr << "Failed to initialize mailbox database\n";
+        log("ERROR", "Failed to initialize mailbox database");
         return 1;
     }
 
@@ -184,10 +192,10 @@ int main(int argc, char* argv[]) {
     char hash_hex[crypto_generichash_BYTES * 2 + 1];
     sodium_bin2hex(hash_hex, sizeof(hash_hex), hash, sizeof(hash));
 
-    std::cout << "Relay pubkey: " << pk_hex << "\n";
-    std::cout << "Relay hashid: " << hash_hex << "\n";
+    log("INFO", std::string("Relay pubkey: ") + pk_hex);
+    log("INFO", std::string("Relay hashid: ") + hash_hex);
 
-    httplib::SSLServer svr("relay.crt","relay.key");
+    httplib::SSLServer svr("relay.crt", "relay.key");
 
     svr.Get(R"(/mailbox/([a-f0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
         std::string hashid = req.matches[1];
@@ -207,11 +215,13 @@ int main(int argc, char* argv[]) {
     svr.Post("/relay/deliver",
              [&](const httplib::Request& req, httplib::Response& res) {
 
-                if(is_rate_limited(req.remote_addr)){
-                    res.status = 429;
-                    res.set_content("Too many requests","text/plain");
-                    return;
-                }
+        if (is_rate_limited(req.remote_addr)) {
+            log("WARN", "Rate limit exceeded for " + req.remote_addr + " on /relay/deliver");
+            res.status = 429;
+            res.set_content("Too many requests", "text/plain");
+            return;
+        }
+
         // -------------------------------
         // Decode Base64
         // -------------------------------
@@ -279,18 +289,14 @@ int main(int argc, char* argv[]) {
             layer_plaintext.begin() + 33,
             layer_plaintext.end());
 
-        // -------------------------------
-        // Print decoded info
-        // -------------------------------
         char next_hashid_hex[65];
         for (size_t i = 0; i < next_hashid.size(); i++)
             std::snprintf(next_hashid_hex + i * 2, 3, "%02x", next_hashid[i]);
         next_hashid_hex[64] = '\0';
 
-        std::cout << "\n===== Onion Layer Received =====\n";
-        std::cout << "Layer Type: " << static_cast<int>(layer_type) << '\n';
-        std::cout << "Next HashID: " << next_hashid_hex << '\n';
-        std::cout << "Remaining Payload: " << remaining.size() << " bytes\n";
+        log("INFO", "Onion layer received, type=" + std::to_string((int)layer_type)
+            + " next=" + std::string(next_hashid_hex)
+            + " size=" + std::to_string(remaining.size()));
 
         // -------------------------------
         // Forward to a known relay, or deliver to mailbox if next_hashid
@@ -321,15 +327,13 @@ int main(int argc, char* argv[]) {
             auto fwd_res = next_hop_client.Post("/relay/deliver", fwd_b64.data(), "text/plain");
 
             if (!fwd_res || fwd_res->status != 200) {
-                std::cout << "Forward to " << it->second.ip << ":" << it->second.port
-                          << " failed\n";
-                std::cout << "================================\n";
+                log("WARN", "Forward to " + it->second.ip + ":" + it->second.port + " failed");
                 res.status = 502;
                 res.set_content("Forward failed", "text/plain");
                 return;
             }
 
-            std::cout << "Forwarded to " << it->second.ip << ":" << it->second.port << "\n";
+            log("INFO", "Forwarded to " + it->second.ip + ":" + it->second.port);
         }
         else {
             // Not a known relay -- must be an ordinary recipient. Store
@@ -344,20 +348,16 @@ int main(int argc, char* argv[]) {
                 sodium_base64_VARIANT_ORIGINAL
             );
 
-          {
-            mailbox_store(next_hashid_hex,mb_b64.data());
-          }
+            mailbox_store(next_hashid_hex, mb_b64.data());
 
-            std::cout << "Delivered to mailbox for " << next_hashid_hex << "\n";
+            log("INFO", "Delivered to mailbox for " + std::string(next_hashid_hex));
         }
-
-        std::cout << "================================\n";
 
         res.status = 200;
         res.set_content("OK", "text/plain");
     });
 
-    std::cout << "Relay hop listening on port " << http_port << '\n';
+    log("INFO", "Relay hop listening on port " + std::to_string(http_port));
 
     svr.listen("127.0.0.1", http_port);
 

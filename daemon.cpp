@@ -10,6 +10,42 @@
 #include <random>
 #include <algorithm>
 #include <cstdio>
+#include <chrono>
+#include <unordered_map>
+#include <ctime>
+
+void log(const std::string& level, const std::string& message) {
+    std::time_t now = std::time(nullptr);
+    char timebuf[32];
+    std::strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+
+    std::cout << "[" << timebuf << "] [" << level << "] " << message << "\n";
+}
+
+std::mutex rate_limit_mutex;
+std::unordered_map<std::string, std::vector<std::chrono::steady_clock::time_point>> request_log;
+
+const int RATE_LIMIT_MAX_REQUESTS = 20;
+const int RATE_LIMIT_WINDOW_SECONDS = 10;
+
+bool is_rate_limited(const std::string& client_ip) {
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(rate_limit_mutex);
+
+    auto& timestamps = request_log[client_ip];
+
+    timestamps.erase(
+        std::remove_if(timestamps.begin(), timestamps.end(),
+            [&](const auto& t) {
+                return std::chrono::duration_cast<std::chrono::seconds>(now - t).count() > RATE_LIMIT_WINDOW_SECONDS;
+            }),
+        timestamps.end()
+    );
+    if (timestamps.size() >= RATE_LIMIT_MAX_REQUESTS) return true;
+
+    timestamps.push_back(now);
+    return false;
+}
 
 bool load_or_generate_keypair(
     const std::string& path,
@@ -91,7 +127,7 @@ bool parseSendBody(
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <daemon_http_port> <keyfile>\n";
+        log("ERROR", std::string("Usage: ") + argv[0] + " <daemon_http_port> <keyfile>");
         return 1;
     }
 
@@ -99,12 +135,12 @@ int main(int argc, char* argv[]) {
     std::string keyfile_path = argv[2];
 
     if (sodium_init() < 0) {
-        std::cerr << "Failed to initialize libsodium\n";
+        log("ERROR", "Failed to initialize libsodium");
         return 1;
     }
 
     if (!load_or_generate_keypair(keyfile_path, g_pk, g_sk)) {
-        std::cerr << "Failed to load/generate keypair\n";
+        log("ERROR", "Failed to load/generate keypair");
         return 1;
     }
 
@@ -113,7 +149,7 @@ int main(int argc, char* argv[]) {
     crypto_generichash(g_hash, sizeof(g_hash), g_pk, sizeof(g_pk), nullptr, 0);
     sodium_bin2hex(g_hash_hex, sizeof(g_hash_hex), g_hash, sizeof(g_hash));
 
-    httplib::SSLServer svr("relay.crt","relay.key");
+    httplib::SSLServer svr("relay.crt", "relay.key");
 
     svr.Get("/identity", [&](const httplib::Request&, httplib::Response& res) {
         std::string json =
@@ -122,76 +158,91 @@ int main(int argc, char* argv[]) {
         res.set_content(json, "application/json");
     });
 
-    svr.Get("/inbox", [&](const httplib::Request&, httplib::Response& res) {
-    std::vector<std::string> decrypted_messages;   // will hold formatted "sender: message" strings
+    svr.Get("/inbox", [&](const httplib::Request& req, httplib::Response& res) {
+        if (is_rate_limited(req.remote_addr)) {
+            log("WARN", "Rate limit exceeded for " + req.remote_addr + " on /inbox");
+            res.status = 429;
+            res.set_content("Too many requests", "text/plain");
+            return;
+        }
 
-    for (const auto& relay : known_relays) {
-        httplib::SSLClient relay_client(relay.ip, std::stoi(relay.port));
-        relay_client.enable_server_certificate_verification(false);
-        auto mailbox_res = relay_client.Get(("/mailbox/" + std::string(g_hash_hex)).c_str());
+        std::vector<std::string> decrypted_messages;   // will hold formatted "sender: message" strings
 
-      
-        if (!mailbox_res || mailbox_res->status != 200) continue;
+        for (const auto& relay : known_relays) {
+            httplib::SSLClient relay_client(relay.ip, std::stoi(relay.port));
+            relay_client.enable_server_certificate_verification(false);
+            auto mailbox_res = relay_client.Get(("/mailbox/" + std::string(g_hash_hex)).c_str());
 
-        // Very simple manual parse of a JSON array of quoted strings:
-        // ["abc==","def=="]  ->  {"abc==", "def=="}
-        const std::string& body = mailbox_res->body;
-        size_t pos = 1;   // skip leading '['
-        while (pos < body.size() && body[pos] != ']') {
-            if (body[pos] == '"') {
-                size_t end = body.find('"', pos + 1);
-                if (end == std::string::npos) break;
+            if (!mailbox_res || mailbox_res->status != 200) continue;
 
-                std::string b64_payload = body.substr(pos + 1, end - pos - 1);
-                pos = end + 1;
+            // Very simple manual parse of a JSON array of quoted strings:
+            // ["abc==","def=="]  ->  {"abc==", "def=="}
+            const std::string& body = mailbox_res->body;
+            size_t pos = 1;   // skip leading '['
+            while (pos < body.size() && body[pos] != ']') {
+                if (body[pos] == '"') {
+                    size_t end = body.find('"', pos + 1);
+                    if (end == std::string::npos) break;
 
-                // decode + decrypt this one payload
-                std::vector<unsigned char> sealed(b64_payload.size());
-                size_t decoded_len = 0;
-                if (sodium_base642bin(
-                        sealed.data(), sealed.size(),
-                        b64_payload.c_str(), b64_payload.size(),
-                        nullptr, &decoded_len, nullptr,
-                        sodium_base64_VARIANT_ORIGINAL) != 0) {
-                    continue;
+                    std::string b64_payload = body.substr(pos + 1, end - pos - 1);
+                    pos = end + 1;
+
+                    // decode + decrypt this one payload
+                    std::vector<unsigned char> sealed(b64_payload.size());
+                    size_t decoded_len = 0;
+                    if (sodium_base642bin(
+                            sealed.data(), sealed.size(),
+                            b64_payload.c_str(), b64_payload.size(),
+                            nullptr, &decoded_len, nullptr,
+                            sodium_base64_VARIANT_ORIGINAL) != 0) {
+                        continue;
+                    }
+                    sealed.resize(decoded_len);
+
+                    if (sealed.size() < crypto_box_SEALBYTES) continue;
+
+                    std::vector<unsigned char> plaintext(sealed.size() - crypto_box_SEALBYTES);
+                    if (crypto_box_seal_open(plaintext.data(), sealed.data(), sealed.size(), g_pk, g_sk) != 0) {
+                        continue;   // not actually for us, or corrupted
+                    }
+
+                    if (plaintext.size() < 1 + crypto_generichash_BYTES * 2) continue;
+
+                    char sender_hex[crypto_generichash_BYTES * 2 + 1];
+                    sodium_bin2hex(sender_hex, sizeof(sender_hex), plaintext.data() + 1, crypto_generichash_BYTES);
+
+                    std::string message(
+                        reinterpret_cast<char*>(plaintext.data() + 1 + crypto_generichash_BYTES * 2),
+                        plaintext.size() - 1 - crypto_generichash_BYTES * 2
+                    );
+
+                    decrypted_messages.push_back(std::string(sender_hex) + ": " + message);
+                } else {
+                    pos++;
                 }
-                sealed.resize(decoded_len);
-
-                if (sealed.size() < crypto_box_SEALBYTES) continue;
-
-                std::vector<unsigned char> plaintext(sealed.size() - crypto_box_SEALBYTES);
-                if (crypto_box_seal_open(plaintext.data(), sealed.data(), sealed.size(), g_pk, g_sk) != 0) {
-                    continue;   // not actually for us, or corrupted
-                }
-
-                if (plaintext.size() < 1 + crypto_generichash_BYTES*2) continue;
-
-                char sender_hex[crypto_generichash_BYTES * 2 + 1];
-                sodium_bin2hex(sender_hex, sizeof(sender_hex), plaintext.data()+1, crypto_generichash_BYTES);
-
-                std::string message(
-                    reinterpret_cast<char*>(plaintext.data()+ 1 + crypto_generichash_BYTES*2),
-                    plaintext.size() - 1 - crypto_generichash_BYTES*2
-                );
-
-                decrypted_messages.push_back(std::string(sender_hex) + ": " + message);
-            } else {
-                pos++;
             }
         }
-    }
 
-    std::string json = "[";
-    for (size_t i = 0; i < decrypted_messages.size(); i++) {
-        if (i > 0) json += ",";
-        json += "\"" + decrypted_messages[i] + "\"";
-    }
-    json += "]";
+        log("INFO", "Inbox check returned " + std::to_string(decrypted_messages.size()) + " message(s)");
 
-    res.set_content(json, "application/json");
-});
+        std::string json = "[";
+        for (size_t i = 0; i < decrypted_messages.size(); i++) {
+            if (i > 0) json += ",";
+            json += "\"" + decrypted_messages[i] + "\"";
+        }
+        json += "]";
+
+        res.set_content(json, "application/json");
+    });
 
     svr.Post("/send", [&](const httplib::Request& req, httplib::Response& res) {
+        if (is_rate_limited(req.remote_addr)) {
+            log("WARN", "Rate limit exceeded for " + req.remote_addr + " on /send");
+            res.status = 429;
+            res.set_content("Too many requests", "text/plain");
+            return;
+        }
+
         std::string recipient_hashid, recipient_pubkey_hex, message;
 
         if (!parseSendBody(req.body, recipient_hashid, recipient_pubkey_hex, message)) {
@@ -201,12 +252,11 @@ int main(int argc, char* argv[]) {
         }
 
         if (known_relays.size() < 3) {
+            log("ERROR", "Not enough known relays configured");
             res.status = 500;
             res.set_content("Not enough known relays configured", "text/plain");
             return;
         }
-
-        
 
         // Decode recipient pubkey and hashid bytes.
         unsigned char recipient_pk[crypto_box_PUBLICKEYBYTES];
@@ -302,12 +352,12 @@ int main(int argc, char* argv[]) {
         auto relay_res = relay_client.Post("/relay/deliver", b64.data(), "text/plain");
 
         if (!relay_res || relay_res->status != 200) {
-            std::cerr << "Relay POST failed.";
-            if(relay_res){
-                std::cerr<< "Status: " << relay_res->status << ", body: "<< relay_res->body<<"\n";
-            }else{
-                std::cerr<<"No Response (connection-level failure): "
-                        << httplib::to_string(relay_res.error())<<"\n";
+            if (relay_res) {
+                log("WARN", "Relay POST failed. Status: " + std::to_string(relay_res->status)
+                    + ", body: " + relay_res->body);
+            } else {
+                log("WARN", "Relay POST failed. No response (connection-level failure): "
+                    + httplib::to_string(relay_res.error()));
             }
             res.status = 502;
             res.set_content("Failed to reach first relay hop", "text/plain");
@@ -318,12 +368,14 @@ int main(int argc, char* argv[]) {
                              + r2.hashid_hex.substr(0, 8) + "->"
                              + r3.hashid_hex.substr(0, 8);
 
+        log("INFO", summary);
+
         res.status = 200;
         res.set_content(summary, "text/plain");
     });
 
-    std::cout << "Daemon listening on port " << daemon_port
-              << ", hashid " << g_hash_hex << "\n";
+    log("INFO", "Daemon listening on port " + std::to_string(daemon_port)
+        + ", hashid " + std::string(g_hash_hex));
 
     svr.listen("127.0.0.1", daemon_port);
 
