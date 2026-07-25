@@ -102,3 +102,9 @@ find_package(OpenSSL REQUIRED)
 
 target_compile_definitions(daemon PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(daemon PRIVATE pthread sodium sqlite3 OpenSSL::SSL OpenSSL::Crypto)
+
+add_executable(cross_test cross_test.cpp)
+target_link_libraries(cross_test PRIVATE sodium)
+
+add_executable(tor_test tor_test.cpp)
+target_link_libraries(tor_test PRIVATE curl)
