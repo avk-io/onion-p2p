@@ -170,15 +170,33 @@ int main(int argc, char* argv[]) {
         std::vector<std::string> decrypted_messages;   // will hold formatted "sender: message" strings
 
         for (const auto& relay : known_relays) {
-            httplib::SSLClient relay_client(relay.onion_host, std::stoi(relay.port));
-            relay_client.enable_server_certificate_verification(false);
-            auto mailbox_res = relay_client.Get(("/mailbox/" + std::string(g_hash_hex)).c_str());
+            CURL* curl = curl_easy_init();
+            if (!curl) continue;
 
-            if (!mailbox_res || mailbox_res->status != 200) continue;
+            std::string url = "https://" + relay.onion_host + ":" + relay.port + "/mailbox/" + std::string(g_hash_hex);
+            std::string curl_response;
+            long http_code = 0;
 
-            // Very simple manual parse of a JSON array of quoted strings:
-            // ["abc==","def=="]  ->  {"abc==", "def=="}
-            const std::string& body = mailbox_res->body;
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_PROXY, "socks5h://127.0.0.1:9050");
+            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+                +[](void* contents, size_t size, size_t nmemb, std::string* out) -> size_t {
+                    out->append(static_cast<char*>(contents), size * nmemb);
+                    return size * nmemb;
+                });
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &curl_response);
+
+            CURLcode curl_res = curl_easy_perform(curl);
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+            curl_easy_cleanup(curl);
+
+            if (curl_res != CURLE_OK || http_code != 200) continue;
+
+// From here down, everything stays the same as before, except:
+// replace every use of "mailbox_res->body" with "curl_response"
+            const std::string& body = curl_response;
             size_t pos = 1;   // skip leading '['
             while (pos < body.size() && body[pos] != ']') {
                 if (body[pos] == '"') {
