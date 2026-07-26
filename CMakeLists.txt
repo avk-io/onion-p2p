@@ -79,7 +79,7 @@ target_link_libraries(daemon_test PRIVATE pthread)
 
 add_executable(relay_http relay_http.cpp)
 target_include_directories(relay_http PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
-target_link_libraries(relay_http PRIVATE pthread sodium)
+target_link_libraries(relay_http PRIVATE pthread sodium sqlite3 curl OpenSSL::SSL OpenSSL::Crypto)
 
 add_executable(make_test_packet make_test_packet.cpp)
 target_link_libraries(make_test_packet PRIVATE sodium)
@@ -89,7 +89,7 @@ target_link_libraries(make_test_packet2 PRIVATE sodium)
 
 add_executable(daemon daemon.cpp)
 target_include_directories(daemon PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
-target_link_libraries(daemon PRIVATE pthread sodium)
+target_link_libraries(daemon PRIVATE pthread sodium curl OpenSSL::SSL OpenSSL::Crypto)
 
 target_link_libraries(relay_http PRIVATE pthread sodium sqlite3)
 
@@ -108,3 +108,4 @@ target_link_libraries(cross_test PRIVATE sodium)
 
 add_executable(tor_test tor_test.cpp)
 target_link_libraries(tor_test PRIVATE curl)
+

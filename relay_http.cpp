@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <ctime>
+#include <curl/curl.h>
 
 void log(const std::string& level, const std::string& message) {
     std::time_t now = std::time(nullptr);
@@ -148,12 +149,14 @@ bool load_or_generate_keypair(
 
 // Temporary hardcoded relay directory: hashid (hex) -> {ip, port}.
 // Real version later reads this from a config file instead.
-
-struct RelayAddr { std::string ip; std::string port; };
+struct RelayAddr { std::string onion_host; std::string port; };
 std::map<std::string, RelayAddr> relay_directory = {
-    { "f58bc6eaad5b76449451abcd2c079b3b171f2ae82d65f73cbcedc22e3968de08", {"127.0.0.1", "8081"} },
-    { "c182b4305a9dd333d5053652f68180fd3d5603a6e97fb1c7258d448e6486ef4a", {"127.0.0.1", "8082"} },
-    { "ae5a05b449d25057f615f2383c931359066ffe5ef3b8e0b3e0fbe359b376eff8", {"127.0.0.1", "8083"} },
+    { "f58bc6eaad5b76449451abcd2c079b3b171f2ae82d65f73cbcedc22e3968de08",
+      {"tbheffnwzhvl2p6k3rcesvy4k7njiafk4x7dvxcdpvabulqbuldphcad.onion", "8081"} },
+    { "c182b4305a9dd333d5053652f68180fd3d5603a6e97fb1c7258d448e6486ef4a",
+      {"diwn2yea7elxobibz4cm6s7glvxxtno3nh7ocor5ofrnouvnynv6isad.onion", "8082"} },
+    { "ae5a05b449d25057f615f2383c931359066ffe5ef3b8e0b3e0fbe359b376eff8",
+      {"aaeqqfkdhf5xmhwu2beg4cxl7orpqnw244a3cugkii5nwr4j3inewpid.onion", "8083"} },
 };
 
 int main(int argc, char* argv[]) {
@@ -322,18 +325,45 @@ int main(int argc, char* argv[]) {
                 sodium_base64_VARIANT_ORIGINAL
             );
 
-            httplib::SSLClient next_hop_client(it->second.ip, std::stoi(it->second.port));
-            next_hop_client.enable_server_certificate_verification(false);
-            auto fwd_res = next_hop_client.Post("/relay/deliver", fwd_b64.data(), "text/plain");
+            CURL* fwd_curl = curl_easy_init();
+            if (!fwd_curl) {
+                log("ERROR", "Failed to initialize libcurl for forwarding");
+                res.status = 500;
+                res.set_content("Internal error", "text/plain");
+                return;
+            }
 
-            if (!fwd_res || fwd_res->status != 200) {
-                log("WARN", "Forward to " + it->second.ip + ":" + it->second.port + " failed");
+            std::string fwd_url = "https://" + it->second.onion_host + ":" + it->second.port + "/relay/deliver";
+            std::string fwd_curl_response;
+            long fwd_http_code = 0;
+
+            curl_easy_setopt(fwd_curl, CURLOPT_URL, fwd_url.c_str());
+            curl_easy_setopt(fwd_curl, CURLOPT_PROXY, "socks5h://127.0.0.1:9050");
+            curl_easy_setopt(fwd_curl, CURLOPT_POST, 1L);
+            curl_easy_setopt(fwd_curl, CURLOPT_POSTFIELDS, fwd_b64.data());
+            curl_easy_setopt(fwd_curl, CURLOPT_SSL_VERIFYPEER, 0L);
+            curl_easy_setopt(fwd_curl, CURLOPT_SSL_VERIFYHOST, 0L);
+            curl_easy_setopt(fwd_curl, CURLOPT_WRITEFUNCTION,
+                +[](void* contents, size_t size, size_t nmemb, std::string* out) -> size_t {
+                    out->append(static_cast<char*>(contents), size * nmemb);
+                    return size * nmemb;
+                });
+            curl_easy_setopt(fwd_curl, CURLOPT_WRITEDATA, &fwd_curl_response);
+
+            CURLcode fwd_curl_res = curl_easy_perform(fwd_curl);
+            curl_easy_getinfo(fwd_curl, CURLINFO_RESPONSE_CODE, &fwd_http_code);
+            curl_easy_cleanup(fwd_curl);
+
+            if (fwd_curl_res != CURLE_OK || fwd_http_code != 200) {
+                log("WARN", "Forward to " + it->second.onion_host + ":" + it->second.port
+                    + " via Tor failed: " + curl_easy_strerror(fwd_curl_res)
+                    + ", status=" + std::to_string(fwd_http_code));
                 res.status = 502;
                 res.set_content("Forward failed", "text/plain");
                 return;
             }
 
-            log("INFO", "Forwarded to " + it->second.ip + ":" + it->second.port);
+            log("INFO", "Forwarded to " + it->second.onion_host + ":" + it->second.port + " via Tor");
         }
         else {
             // Not a known relay -- must be an ordinary recipient. Store

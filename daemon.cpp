@@ -13,6 +13,7 @@
 #include <chrono>
 #include <unordered_map>
 #include <ctime>
+#include <curl/curl.h>
 
 void log(const std::string& level, const std::string& message) {
     std::time_t now = std::time(nullptr);
@@ -80,20 +81,20 @@ bool load_or_generate_keypair(
 // Option A means relay hops are a small, operator-controlled set, not
 // discovered dynamically.
 struct RelayAddr {
-    std::string ip;
+    std::string onion_host;
     std::string port;
     std::string pubkey_hex;
     std::string hashid_hex;
 };
 
 std::vector<RelayAddr> known_relays = {
-    { "127.0.0.1", "8081",
+    { "tbheffnwzhvl2p6k3rcesvy4k7njiafk4x7dvxcdpvabulqbuldphcad.onion", "8081",
       "3b6bf21b2b261cb04d29c6a0a8eaeaa64aebc0aee1fb7efb4eb0cb4385ce0f6d",
       "f58bc6eaad5b76449451abcd2c079b3b171f2ae82d65f73cbcedc22e3968de08" },
-    { "127.0.0.1", "8082",
+    { "diwn2yea7elxobibz4cm6s7glvxxtno3nh7ocor5ofrnouvnynv6isad.onion", "8082",
       "95738bbedcbe1332afc8234f7778158cdfcd8d8a62c67fa225a7de53a646e46a",
       "c182b4305a9dd333d5053652f68180fd3d5603a6e97fb1c7258d448e6486ef4a" },
-    { "127.0.0.1", "8083",
+    { "aaeqqfkdhf5xmhwu2beg4cxl7orpqnw244a3cugkii5nwr4j3inewpid.onion", "8083",
       "274106e312572dfdda19dcda3e45612f455229f38a30e5cabf0899c0984e2e53",
       "ae5a05b449d25057f615f2383c931359066ffe5ef3b8e0b3e0fbe359b376eff8" },
 };
@@ -169,7 +170,7 @@ int main(int argc, char* argv[]) {
         std::vector<std::string> decrypted_messages;   // will hold formatted "sender: message" strings
 
         for (const auto& relay : known_relays) {
-            httplib::SSLClient relay_client(relay.ip, std::stoi(relay.port));
+            httplib::SSLClient relay_client(relay.onion_host, std::stoi(relay.port));
             relay_client.enable_server_certificate_verification(false);
             auto mailbox_res = relay_client.Get(("/mailbox/" + std::string(g_hash_hex)).c_str());
 
@@ -347,18 +348,38 @@ int main(int argc, char* argv[]) {
         std::vector<char> b64(b64_len);
         sodium_bin2base64(b64.data(), b64.size(), sealed_r1.data(), sealed_r1.size(), sodium_base64_VARIANT_ORIGINAL);
 
-        httplib::SSLClient relay_client(r1.ip, std::stoi(r1.port));
-        relay_client.enable_server_certificate_verification(false);
-        auto relay_res = relay_client.Post("/relay/deliver", b64.data(), "text/plain");
+      CURL* curl = curl_easy_init();
+        if (!curl) {
+            log("ERROR", "Failed to initialize libcurl");
+            res.status = 500;
+            res.set_content("Internal error", "text/plain");
+            return;
+        }
 
-        if (!relay_res || relay_res->status != 200) {
-            if (relay_res) {
-                log("WARN", "Relay POST failed. Status: " + std::to_string(relay_res->status)
-                    + ", body: " + relay_res->body);
-            } else {
-                log("WARN", "Relay POST failed. No response (connection-level failure): "
-                    + httplib::to_string(relay_res.error()));
-            }
+        std::string url = "https://" + r1.onion_host + ":" + r1.port + "/relay/deliver";
+        std::string curl_response;
+        long http_code = 0;
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_PROXY, "socks5h://127.0.0.1:9050");
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, b64.data());
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+            +[](void* contents, size_t size, size_t nmemb, std::string* out) -> size_t {
+                out->append(static_cast<char*>(contents), size * nmemb);
+                return size * nmemb;
+            });
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &curl_response);
+
+        CURLcode curl_res = curl_easy_perform(curl);
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_easy_cleanup(curl);
+
+        if (curl_res != CURLE_OK || http_code != 200) {
+            log("WARN", "Relay POST via Tor failed: " + std::string(curl_easy_strerror(curl_res))
+                + ", status=" + std::to_string(http_code));
             res.status = 502;
             res.set_content("Failed to reach first relay hop", "text/plain");
             return;
