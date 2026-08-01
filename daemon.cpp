@@ -1,9 +1,7 @@
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
 #include <sodium.h>
-#include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -48,38 +46,11 @@ bool is_rate_limited(const std::string& client_ip) {
     return false;
 }
 
-bool load_or_generate_keypair(
-    const std::string& path,
-    unsigned char pk[crypto_box_PUBLICKEYBYTES],
-    unsigned char sk[crypto_box_SECRETKEYBYTES])
-{
-    namespace fs = std::filesystem;
-
-    if (fs::exists(path)) {
-        std::ifstream in(path, std::ios::binary);
-        if (!in) return false;
-
-        in.read(reinterpret_cast<char*>(pk), crypto_box_PUBLICKEYBYTES);
-        in.read(reinterpret_cast<char*>(sk), crypto_box_SECRETKEYBYTES);
-
-        return in.good();
-    }
-
-    crypto_box_keypair(pk, sk);
-
-    std::ofstream out(path, std::ios::binary);
-    if (!out) return false;
-
-    out.write(reinterpret_cast<const char*>(pk), crypto_box_PUBLICKEYBYTES);
-    out.write(reinterpret_cast<const char*>(sk), crypto_box_SECRETKEYBYTES);
-
-    return out.good();
-}
-
-// Fixed set of relay servers this daemon knows about. In a real
-// deployment this would come from a config file; hardcoded here since
-// Option A means relay hops are a small, operator-controlled set, not
-// discovered dynamically.
+// Fixed set of relay servers, reachable as Tor hidden services. This
+// daemon is now a shared, stateless piece of infrastructure -- it never
+// holds any individual user's keys. Every request carries whatever
+// identity info it needs (sender hashid to seal with, recipient info to
+// address the packet, or a hashid to poll a mailbox for).
 struct RelayAddr {
     std::string onion_host;
     std::string port;
@@ -99,66 +70,52 @@ std::vector<RelayAddr> known_relays = {
       "ae5a05b449d25057f615f2383c931359066ffe5ef3b8e0b3e0fbe359b376eff8" },
 };
 
-unsigned char g_pk[crypto_box_PUBLICKEYBYTES];
-unsigned char g_sk[crypto_box_SECRETKEYBYTES];
-char g_pk_hex[crypto_box_PUBLICKEYBYTES * 2 + 1];
-char g_hash_hex[crypto_generichash_BYTES * 2 + 1];
-unsigned char g_hash[crypto_generichash_BYTES];
-
-// Splits body on '|' -- placeholder wire format until real JSON parsing
-// is added. Expected: recipient_hashid|recipient_pubkey_hex|message
+// Splits body on '|'. New format includes sender_hashid up front, since
+// the daemon has no identity of its own to fall back on:
+// sender_hashid|recipient_hashid|recipient_pubkey_hex|message
 bool parseSendBody(
     const std::string& body,
+    std::string& sender_hashid,
     std::string& recipient_hashid,
     std::string& recipient_pubkey_hex,
     std::string& message)
 {
-    size_t first = body.find('|');
-    if (first == std::string::npos) return false;
+    size_t p1 = body.find('|');
+    if (p1 == std::string::npos) return false;
 
-    size_t second = body.find('|', first + 1);
-    if (second == std::string::npos) return false;
+    size_t p2 = body.find('|', p1 + 1);
+    if (p2 == std::string::npos) return false;
 
-    recipient_hashid = body.substr(0, first);
-    recipient_pubkey_hex = body.substr(first + 1, second - first - 1);
-    message = body.substr(second + 1);
+    size_t p3 = body.find('|', p2 + 1);
+    if (p3 == std::string::npos) return false;
 
-    return !recipient_hashid.empty() && !recipient_pubkey_hex.empty();
+    sender_hashid = body.substr(0, p1);
+    recipient_hashid = body.substr(p1 + 1, p2 - p1 - 1);
+    recipient_pubkey_hex = body.substr(p2 + 1, p3 - p2 - 1);
+    message = body.substr(p3 + 1);
+
+    return !sender_hashid.empty() && !recipient_hashid.empty() && !recipient_pubkey_hex.empty();
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        log("ERROR", std::string("Usage: ") + argv[0] + " <daemon_http_port> <keyfile>");
+    if (argc != 2) {
+        log("ERROR", std::string("Usage: ") + argv[0] + " <daemon_http_port>");
         return 1;
     }
 
     int daemon_port = std::stoi(argv[1]);
-    std::string keyfile_path = argv[2];
 
     if (sodium_init() < 0) {
         log("ERROR", "Failed to initialize libsodium");
         return 1;
     }
 
-    if (!load_or_generate_keypair(keyfile_path, g_pk, g_sk)) {
-        log("ERROR", "Failed to load/generate keypair");
-        return 1;
-    }
-
-    sodium_bin2hex(g_pk_hex, sizeof(g_pk_hex), g_pk, sizeof(g_pk));
-
-    crypto_generichash(g_hash, sizeof(g_hash), g_pk, sizeof(g_pk), nullptr, 0);
-    sodium_bin2hex(g_hash_hex, sizeof(g_hash_hex), g_hash, sizeof(g_hash));
-
     httplib::SSLServer svr("relay.crt", "relay.key");
 
-    svr.Get("/identity", [&](const httplib::Request&, httplib::Response& res) {
-        std::string json =
-            "{\"pubkey\":\"" + std::string(g_pk_hex) +
-            "\",\"hashid\":\"" + std::string(g_hash_hex) + "\"}";
-        res.set_content(json, "application/json");
-    });
-
+    // Returns raw, still-sealed base64 blobs for the given hashid --
+    // NO decryption happens here. The daemon has no private keys to
+    // decrypt with; the caller (browser, holding the key locally) is
+    // responsible for calling crypto_box_seal_open itself.
     svr.Get("/inbox", [&](const httplib::Request& req, httplib::Response& res) {
         if (is_rate_limited(req.remote_addr)) {
             log("WARN", "Rate limit exceeded for " + req.remote_addr + " on /inbox");
@@ -167,13 +124,20 @@ int main(int argc, char* argv[]) {
             return;
         }
 
-        std::vector<std::string> decrypted_messages;   // will hold formatted "sender: message" strings
+        if (!req.has_param("hashid")) {
+            res.status = 400;
+            res.set_content("Missing hashid query parameter", "text/plain");
+            return;
+        }
+        std::string hashid = req.get_param_value("hashid");
+
+        std::vector<std::string> raw_sealed_blobs;
 
         for (const auto& relay : known_relays) {
             CURL* curl = curl_easy_init();
             if (!curl) continue;
 
-            std::string url = "https://" + relay.onion_host + ":" + relay.port + "/mailbox/" + std::string(g_hash_hex);
+            std::string url = "https://" + relay.onion_host + ":" + relay.port + "/mailbox/" + hashid;
             std::string curl_response;
             long http_code = 0;
 
@@ -194,60 +158,30 @@ int main(int argc, char* argv[]) {
 
             if (curl_res != CURLE_OK || http_code != 200) continue;
 
-// From here down, everything stays the same as before, except:
-// replace every use of "mailbox_res->body" with "curl_response"
+            // Manual parse of a JSON array of quoted base64 strings:
+            // ["abc==","def=="]  ->  push each string as-is, undecoded.
             const std::string& body = curl_response;
-            size_t pos = 1;   // skip leading '['
+            size_t pos = 1;
             while (pos < body.size() && body[pos] != ']') {
                 if (body[pos] == '"') {
                     size_t end = body.find('"', pos + 1);
                     if (end == std::string::npos) break;
 
-                    std::string b64_payload = body.substr(pos + 1, end - pos - 1);
+                    raw_sealed_blobs.push_back(body.substr(pos + 1, end - pos - 1));
                     pos = end + 1;
-
-                    // decode + decrypt this one payload
-                    std::vector<unsigned char> sealed(b64_payload.size());
-                    size_t decoded_len = 0;
-                    if (sodium_base642bin(
-                            sealed.data(), sealed.size(),
-                            b64_payload.c_str(), b64_payload.size(),
-                            nullptr, &decoded_len, nullptr,
-                            sodium_base64_VARIANT_ORIGINAL) != 0) {
-                        continue;
-                    }
-                    sealed.resize(decoded_len);
-
-                    if (sealed.size() < crypto_box_SEALBYTES) continue;
-
-                    std::vector<unsigned char> plaintext(sealed.size() - crypto_box_SEALBYTES);
-                    if (crypto_box_seal_open(plaintext.data(), sealed.data(), sealed.size(), g_pk, g_sk) != 0) {
-                        continue;   // not actually for us, or corrupted
-                    }
-
-                    if (plaintext.size() < 1 + crypto_generichash_BYTES * 2) continue;
-
-                    char sender_hex[crypto_generichash_BYTES * 2 + 1];
-                    sodium_bin2hex(sender_hex, sizeof(sender_hex), plaintext.data() + 1, crypto_generichash_BYTES);
-
-                    std::string message(
-                        reinterpret_cast<char*>(plaintext.data() + 1 + crypto_generichash_BYTES * 2),
-                        plaintext.size() - 1 - crypto_generichash_BYTES * 2
-                    );
-
-                    decrypted_messages.push_back(std::string(sender_hex) + ": " + message);
                 } else {
                     pos++;
                 }
             }
         }
 
-        log("INFO", "Inbox check returned " + std::to_string(decrypted_messages.size()) + " message(s)");
+        log("INFO", "Inbox check for " + hashid + " returned "
+            + std::to_string(raw_sealed_blobs.size()) + " raw sealed message(s)");
 
         std::string json = "[";
-        for (size_t i = 0; i < decrypted_messages.size(); i++) {
+        for (size_t i = 0; i < raw_sealed_blobs.size(); i++) {
             if (i > 0) json += ",";
-            json += "\"" + decrypted_messages[i] + "\"";
+            json += "\"" + raw_sealed_blobs[i] + "\"";
         }
         json += "]";
 
@@ -262,11 +196,13 @@ int main(int argc, char* argv[]) {
             return;
         }
 
-        std::string recipient_hashid, recipient_pubkey_hex, message;
+        std::string sender_hashid, recipient_hashid, recipient_pubkey_hex, message;
 
-        if (!parseSendBody(req.body, recipient_hashid, recipient_pubkey_hex, message)) {
+        if (!parseSendBody(req.body, sender_hashid, recipient_hashid, recipient_pubkey_hex, message)) {
             res.status = 400;
-            res.set_content("Expected body: recipient_hashid|recipient_pubkey_hex|message", "text/plain");
+            res.set_content(
+                "Expected body: sender_hashid|recipient_hashid|recipient_pubkey_hex|message",
+                "text/plain");
             return;
         }
 
@@ -277,12 +213,19 @@ int main(int argc, char* argv[]) {
             return;
         }
 
-        // Decode recipient pubkey and hashid bytes.
+        // Sender's identity here is JUST their hashid -- a public,
+        // non-secret value the caller already knows about themselves.
+        // No private key is needed to build the outer layers; sealing
+        // only ever requires the RECIPIENT's public key at each step.
+        unsigned char sender_hash_bytes[crypto_generichash_BYTES];
         unsigned char recipient_pk[crypto_box_PUBLICKEYBYTES];
         unsigned char recipient_hash_bytes[crypto_generichash_BYTES];
         size_t bin_len;
 
         bool ok =
+            sodium_hex2bin(sender_hash_bytes, sizeof(sender_hash_bytes),
+                sender_hashid.c_str(), sender_hashid.size(),
+                nullptr, &bin_len, nullptr) == 0 &&
             sodium_hex2bin(recipient_pk, sizeof(recipient_pk),
                 recipient_pubkey_hex.c_str(), recipient_pubkey_hex.size(),
                 nullptr, &bin_len, nullptr) == 0 &&
@@ -292,7 +235,7 @@ int main(int argc, char* argv[]) {
 
         if (!ok) {
             res.status = 400;
-            res.set_content("Invalid recipient hex fields", "text/plain");
+            res.set_content("Invalid hex fields", "text/plain");
             return;
         }
 
@@ -327,7 +270,7 @@ int main(int argc, char* argv[]) {
         // sender_hashid(32) + recipient_hashid(32) + message
         std::vector<unsigned char> plaintext_final;
         plaintext_final.push_back(0x01);
-        plaintext_final.insert(plaintext_final.end(), g_hash, g_hash + crypto_generichash_BYTES);
+        plaintext_final.insert(plaintext_final.end(), sender_hash_bytes, sender_hash_bytes + crypto_generichash_BYTES);
         plaintext_final.insert(plaintext_final.end(), recipient_hash_bytes, recipient_hash_bytes + crypto_generichash_BYTES);
         plaintext_final.insert(plaintext_final.end(), message.begin(), message.end());
 
@@ -361,12 +304,12 @@ int main(int argc, char* argv[]) {
         std::vector<unsigned char> sealed_r1(plaintext_r1.size() + crypto_box_SEALBYTES);
         crypto_box_seal(sealed_r1.data(), plaintext_r1.data(), plaintext_r1.size(), r1_pk);
 
-        // ---- base64-encode and POST to r1 ----
+        // ---- base64-encode and POST to r1, through Tor ----
         size_t b64_len = sodium_base64_ENCODED_LEN(sealed_r1.size(), sodium_base64_VARIANT_ORIGINAL);
         std::vector<char> b64(b64_len);
         sodium_bin2base64(b64.data(), b64.size(), sealed_r1.data(), sealed_r1.size(), sodium_base64_VARIANT_ORIGINAL);
 
-      CURL* curl = curl_easy_init();
+        CURL* curl = curl_easy_init();
         if (!curl) {
             log("ERROR", "Failed to initialize libcurl");
             res.status = 500;
@@ -413,8 +356,7 @@ int main(int argc, char* argv[]) {
         res.set_content(summary, "text/plain");
     });
 
-    log("INFO", "Daemon listening on port " + std::to_string(daemon_port)
-        + ", hashid " + std::string(g_hash_hex));
+    log("INFO", "Daemon listening on port " + std::to_string(daemon_port) + " (stateless, no identity held)");
 
     svr.listen("127.0.0.1", daemon_port);
 
